@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SOCKET_RE = re.compile(r"socket:\[(\d+)\]")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_text(path: Path, strip: bool = True) -> str | None:
+    try:
+        data = path.read_text(errors="replace")
+    except OSError:
+        return None
+    return data.strip() if strip else data
+
+
+def safe_link(path: Path) -> str | None:
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+def read_cmdline(pid: int) -> list[str]:
+    path = Path(f"/proc/{pid}/cmdline")
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+
+
+def list_all_pids() -> list[int]:
+    pids: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            pids.append(int(entry.name))
+    return pids
+
+
+def process_tree(root_pid: int) -> list[int]:
+    children_by_parent: dict[int, list[int]] = {}
+    for pid in list_all_pids():
+        status = safe_text(Path(f"/proc/{pid}/status"))
+        if not status:
+            continue
+        parent = None
+        for line in status.splitlines():
+            if line.startswith("PPid:"):
+                try:
+                    parent = int(line.split()[1])
+                except (IndexError, ValueError):
+                    parent = None
+                break
+        if parent is not None:
+            children_by_parent.setdefault(parent, []).append(pid)
+
+    ordered: list[int] = []
+    stack = [root_pid]
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        ordered.append(pid)
+        stack.extend(sorted(children_by_parent.get(pid, []), reverse=True))
+    return sorted(ordered)
+
+
+def run_capture(cmd: list[str], timeout: float = 5.0) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "missing": True, "cmd": cmd}
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "timeout": True,
+            "cmd": cmd,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+        }
+    return {
+        "ok": proc.returncode == 0,
+        "cmd": cmd,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
+def parse_lsof_output(text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    if not lines:
+        return rows
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        rows.append(
+            {
+                "command": parts[0],
+                "pid": parts[1],
+                "user": parts[2],
+                "fd": parts[3],
+                "type": parts[4],
+                "device": parts[5],
+                "size_off": parts[6],
+                "node": parts[7],
+                "name": " ".join(parts[8:]),
+            }
+        )
+    return rows
+
+
+def parse_ss_output(text: str, pids: set[int]) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    pending: dict[str, Any] | None = None
+    for line in text.splitlines():
+        if not line:
+            continue
+        if line[0].isspace():
+            if pending is None:
+                continue
+            pending.setdefault("details", []).append(line.strip())
+            for pid in pids:
+                marker = f'pid={pid},'
+                if marker in line or line.rstrip().endswith(f"pid={pid})"):
+                    pending["matched_pid"] = pid
+                    matches.append(pending)
+                    pending = None
+                    break
+            continue
+
+        parts = line.split()
+        if len(parts) < 5 or parts[0] == "State":
+            pending = None
+            continue
+        pending = {
+            "state": parts[0],
+            "recv_q": parts[1],
+            "send_q": parts[2],
+            "local": parts[3],
+            "peer": parts[4],
+        }
+    return matches
+
+
+def read_fd_links(pid: int) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    fd_dir = Path(f"/proc/{pid}/fd")
+    if not fd_dir.exists():
+        return out
+    for entry in sorted(fd_dir.iterdir(), key=lambda p: int(p.name)):
+        out.append({"fd": entry.name, "target": safe_link(entry)})
+    return out
+
+
+def decode_ipv4(hex_ip: str) -> str:
+    raw = bytes.fromhex(hex_ip)
+    return ".".join(str(part) for part in raw[::-1])
+
+
+def decode_ipv6(hex_ip: str) -> str:
+    raw = bytes.fromhex(hex_ip)
+    groups = [raw[index:index + 2] for index in range(0, 16, 2)]
+    return ":".join(f"{int.from_bytes(group, 'big'):x}" for group in groups)
+
+
+def decode_addr(raw: str, family: str) -> str:
+    ip_hex, port_hex = raw.split(":")
+    port = int(port_hex, 16)
+    if family == "ipv6":
+        return f"{decode_ipv6(ip_hex)}:{port}"
+    return f"{decode_ipv4(ip_hex)}:{port}"
+
+
+def parse_proc_net_table(path: Path, proto: str, family: str) -> list[dict[str, Any]]:
+    text = safe_text(path, strip=False)
+    if not text:
+        return []
+    rows: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        rows.append(
+            {
+                "proto": proto,
+                "family": family,
+                "local": decode_addr(parts[1], family),
+                "remote": decode_addr(parts[2], family),
+                "state": parts[3],
+                "tx_queue": parts[4].split(":")[0],
+                "rx_queue": parts[4].split(":")[1],
+                "uid": parts[7],
+                "inode": parts[9],
+            }
+        )
+    return rows
+
+
+def read_proc_net_by_inode() -> dict[str, dict[str, Any]]:
+    tables = [
+        (Path("/proc/net/tcp"), "tcp", "ipv4"),
+        (Path("/proc/net/tcp6"), "tcp", "ipv6"),
+        (Path("/proc/net/udp"), "udp", "ipv4"),
+        (Path("/proc/net/udp6"), "udp", "ipv6"),
+    ]
+    by_inode: dict[str, dict[str, Any]] = {}
+    for path, proto, family in tables:
+        for row in parse_proc_net_table(path, proto, family):
+            by_inode[row["inode"]] = row
+    return by_inode
+
+
+def socket_inodes_from_fd_links(fd_links: list[dict[str, Any]]) -> list[str]:
+    inodes: list[str] = []
+    for fd_link in fd_links:
+        target = fd_link.get("target") or ""
+        match = SOCKET_RE.fullmatch(target)
+        if match:
+            inodes.append(match.group(1))
+    return inodes
+
+
+def read_process_snapshot(pid: int, include_env: bool) -> dict[str, Any]:
+    base = Path(f"/proc/{pid}")
+    snapshot: dict[str, Any] = {
+        "pid": pid,
+        "cmdline": read_cmdline(pid),
+        "status": safe_text(base / "status", strip=False),
+        "stat": safe_text(base / "stat"),
+        "io": safe_text(base / "io", strip=False),
+        "limits": safe_text(base / "limits", strip=False),
+        "cwd": safe_link(base / "cwd"),
+        "exe": safe_link(base / "exe"),
+        "fd_links": read_fd_links(pid),
+    }
+    if include_env:
+        try:
+            raw = (base / "environ").read_bytes()
+            snapshot["environ"] = [
+                item.decode(errors="replace") for item in raw.split(b"\0") if item
+            ]
+        except OSError:
+            snapshot["environ"] = None
+    return snapshot
+
+
+@dataclass
+class ToolProcess:
+    name: str
+    proc: subprocess.Popen[str]
+    output: str
+
+
+class Session:
+    def __init__(
+        self,
+        output_dir: Path,
+        events_path_override: str | None = None,
+        summary_path_override: str | None = None,
+    ) -> None:
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.events_path = (
+            Path(events_path_override).expanduser().resolve()
+            if events_path_override
+            else self.output_dir / "events.jsonl"
+        )
+        self.summary_path = (
+            Path(summary_path_override).expanduser().resolve()
+            if summary_path_override
+            else self.output_dir / "summary.json"
+        )
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        self.summary_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def write_json(self, name: str, data: Any) -> None:
+        path = self.summary_path if name == "summary.json" else self.output_dir / name
+        path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+    def event(self, kind: str, **payload: Any) -> None:
+        record = {"ts": utc_now(), "type": kind, **payload}
+        with self._lock:
+            with self.events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def spawn_strace(pid: int, output_dir: Path, trace_mode: str, string_bytes: int) -> ToolProcess | None:
+    if shutil.which("strace") is None:
+        return None
+    trace_expr = "%network,%process,%file,%desc" if trace_mode == "broad" else "%network"
+    cmd = [
+        "strace",
+        "-ff",
+        "-tt",
+        "-yy",
+        "-xx",
+        "-v",
+        "-s",
+        str(string_bytes),
+        "-e",
+        f"trace={trace_expr}",
+        "-o",
+        str(output_dir / "strace"),
+        "-p",
+        str(pid),
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    return ToolProcess("strace", proc, str(output_dir / "strace*"))
+
+
+def spawn_command_under_strace(
+    command: list[str],
+    output_dir: Path,
+    trace_mode: str,
+    string_bytes: int,
+) -> tuple[ToolProcess | None, Path]:
+    pid_file = output_dir / "root.pid"
+    if shutil.which("strace") is None:
+        return None, pid_file
+    trace_expr = "%network,%process,%file,%desc" if trace_mode == "broad" else "%network"
+    wrapper = (
+        "import os, sys; "
+        "open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid())); "
+        "os.execvp(sys.argv[2], sys.argv[2:])"
+    )
+    cmd = [
+        "strace",
+        "-ff",
+        "-tt",
+        "-yy",
+        "-xx",
+        "-v",
+        "-s",
+        str(string_bytes),
+        "-e",
+        f"trace={trace_expr}",
+        "-o",
+        str(output_dir / "strace"),
+        "python3",
+        "-c",
+        wrapper,
+        str(pid_file),
+        *command,
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    return ToolProcess("strace", proc, str(output_dir / "strace*")), pid_file
+
+
+def spawn_tcpdump(output_dir: Path, bpf_filter: str | None) -> ToolProcess | None:
+    if shutil.which("tcpdump") is None:
+        return None
+    cmd = ["tcpdump", "-i", "any", "-nn", "-s", "0", "-U", "-w", str(output_dir / "traffic.pcap")]
+    if bpf_filter:
+        cmd.extend(bpf_filter.split())
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    return ToolProcess("tcpdump", proc, str(output_dir / "traffic.pcap"))
+
+
+def terminate_tool(tool: ToolProcess, session: Session) -> None:
+    if tool.proc.poll() is None:
+        tool.proc.terminate()
+        try:
+            tool.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            tool.proc.kill()
+    stderr = ""
+    if tool.proc.stderr is not None:
+        stderr = tool.proc.stderr.read()
+    session.event(
+        "tool_exit",
+        tool=tool.name,
+        returncode=tool.proc.returncode,
+        output=tool.output,
+        stderr=stderr.strip(),
+    )
+
+
+def monitor_loop(
+    root_pid: int,
+    session: Session,
+    include_env: bool,
+    interval: float,
+    stop_event: threading.Event,
+) -> dict[str, Any]:
+    snapshot_count = 0
+    last_tree: list[int] = []
+    while not stop_event.is_set():
+        if not Path(f"/proc/{root_pid}").exists():
+            session.event("process_exit", pid=root_pid)
+            break
+
+        pids = process_tree(root_pid)
+        last_tree = pids
+        proc_data = []
+        socket_rows: list[dict[str, Any]] = []
+        proc_net = read_proc_net_by_inode()
+        for pid in pids:
+            if Path(f"/proc/{pid}").exists():
+                snapshot = read_process_snapshot(pid, include_env)
+                proc_data.append(snapshot)
+                for inode in socket_inodes_from_fd_links(snapshot["fd_links"]):
+                    row = proc_net.get(inode)
+                    if row:
+                        socket_rows.append({"pid": pid, **row})
+
+        lsof_rows: list[dict[str, Any]] = []
+        for pid in pids:
+            lsof_result = run_capture(["lsof", "-nP", "-p", str(pid)], timeout=5)
+            if lsof_result.get("ok"):
+                lsof_rows.extend(parse_lsof_output(lsof_result["stdout"]))
+
+        ss_result = run_capture(["ss", "-tpna"], timeout=5)
+        ss_rows = parse_ss_output(ss_result.get("stdout", ""), set(pids)) if ss_result.get("stdout") else []
+
+        session.event(
+            "snapshot",
+            root_pid=root_pid,
+            pids=pids,
+            processes=proc_data,
+            proc_net=socket_rows,
+            lsof=lsof_rows,
+            ss=ss_rows,
+        )
+        snapshot_count += 1
+        stop_event.wait(interval)
+
+    return {"snapshot_count": snapshot_count, "last_tree": last_tree}
+
+
+def signal_name(sig: int) -> str:
+    try:
+        return signal.Signals(sig).name
+    except ValueError:
+        return str(sig)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pwatch",
+        description="Observe a Linux process tree with /proc snapshots, strace, lsof, ss, and optional pcap.",
+        epilog=(
+            "Examples:\n"
+            "  pwatch run -- curl https://example.com\n"
+            "  pwatch --duration 15 attach 12345\n"
+            "  sudo pwatch --pcap --pcap-filter \"tcp port 443\" attach 12345\n\n"
+            "Notes:\n"
+            "  - run mode is best when you can start the target yourself.\n"
+            "  - proc_net, ss, lsof, and strace data are correlated to the PID tree.\n"
+            "  - --pcap captures host packets and may include traffic from other processes."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument("--output", default=None, help="Output directory. Defaults to ./pwatch-<timestamp>.")
+    parser.add_argument(
+        "--events-file",
+        default=None,
+        help="Optional explicit path for the JSONL event stream. Defaults to <output>/events.jsonl.",
+    )
+    parser.add_argument(
+        "--summary-file",
+        default=None,
+        help="Optional explicit path for the final summary JSON. Defaults to <output>/summary.json.",
+    )
+    parser.add_argument("--interval", type=float, default=1.0, help="Snapshot interval in seconds.")
+    parser.add_argument("--duration", type=float, default=None, help="Optional max runtime in seconds.")
+    parser.add_argument("--include-env", action="store_true", help="Capture process environments from /proc/<pid>/environ.")
+    parser.add_argument(
+        "--trace-mode",
+        choices=["network", "broad"],
+        default="broad",
+        help="Use network-only syscall tracing or a broader syscall set.",
+    )
+    parser.add_argument("--string-bytes", type=int, default=4096, help="Max string bytes for strace decoding.")
+    parser.add_argument("--pcap", action="store_true", help="Capture host-level packets to traffic.pcap with tcpdump.")
+    parser.add_argument(
+        "--pcap-filter",
+        default=None,
+        help="Optional tcpdump BPF filter, for example: tcp port 443",
+    )
+
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    attach = subparsers.add_parser("attach", help="Attach to an existing PID.")
+    attach.add_argument("pid", type=int, help="PID to observe.")
+
+    run = subparsers.add_parser("run", help="Start a command, then observe it.")
+    run.add_argument("command", nargs=argparse.REMAINDER, help="Command to run. Use: pwatch run -- <cmd> ...")
+
+    return parser
+
+
+def resolve_output_dir(raw: str | None) -> Path:
+    if raw:
+        return Path(raw).expanduser().resolve()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path.cwd() / f"pwatch-{stamp}"
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    output_dir = resolve_output_dir(args.output)
+    session = Session(output_dir, args.events_file, args.summary_file)
+    stop_event = threading.Event()
+    root_pid: int
+    target_proc: subprocess.Popen[str] | None = None
+    tools: list[ToolProcess] = []
+    summary: dict[str, Any] = {
+        "started_at": utc_now(),
+        "mode": args.mode,
+        "output_dir": str(output_dir),
+        "events_file": str(session.events_path),
+        "summary_file": str(session.summary_path),
+        "hostname": os.uname().nodename,
+    }
+
+    if args.mode == "run":
+        command = args.command
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            print("pwatch run requires a command. Example: pwatch run -- curl https://example.com", file=sys.stderr)
+            return 2
+        summary["command"] = command
+        strace_tool, pid_file = spawn_command_under_strace(command, output_dir, args.trace_mode, args.string_bytes)
+        if strace_tool is None:
+            target_proc = subprocess.Popen(command, text=True)
+            root_pid = target_proc.pid
+        else:
+            tools.append(strace_tool)
+            session.event("tool_start", tool="strace", output=strace_tool.output)
+            deadline = time.time() + 5
+            pid_text = None
+            while time.time() < deadline:
+                pid_text = safe_text(pid_file)
+                if pid_text:
+                    break
+                if strace_tool.proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if not pid_text:
+                stderr = ""
+                if strace_tool.proc.stderr is not None:
+                    stderr = strace_tool.proc.stderr.read().strip()
+                print("Unable to determine spawned PID. Check strace permissions.", file=sys.stderr)
+                if stderr:
+                    print(stderr, file=sys.stderr)
+                return 1
+            root_pid = int(pid_text)
+    else:
+        root_pid = args.pid
+        if not Path(f"/proc/{root_pid}").exists():
+            print(f"PID {root_pid} does not exist.", file=sys.stderr)
+            return 1
+
+    session.write_json(
+        "metadata.json",
+        {
+            **summary,
+            "root_pid": root_pid,
+            "interval_seconds": args.interval,
+            "duration_seconds": args.duration,
+            "include_env": args.include_env,
+            "trace_mode": args.trace_mode,
+            "string_bytes": args.string_bytes,
+            "pcap": args.pcap,
+            "pcap_filter": args.pcap_filter,
+            "events_file": str(session.events_path),
+            "summary_file": str(session.summary_path),
+        },
+    )
+    session.event("session_start", root_pid=root_pid, mode=args.mode)
+
+    def stop_handler(signum: int, _frame: Any) -> None:
+        session.event("signal", signal=signal_name(signum))
+        stop_event.set()
+        if target_proc is not None and target_proc.poll() is None:
+            target_proc.terminate()
+
+    signal.signal(signal.SIGINT, stop_handler)
+    signal.signal(signal.SIGTERM, stop_handler)
+
+    if args.mode == "attach":
+        strace_tool = spawn_strace(root_pid, output_dir, args.trace_mode, args.string_bytes)
+        if strace_tool is None:
+            session.event("warning", message="strace is not available")
+        else:
+            tools.append(strace_tool)
+            session.event("tool_start", tool="strace", output=strace_tool.output)
+
+    if args.pcap:
+        tcpdump_tool = spawn_tcpdump(output_dir, args.pcap_filter)
+        if tcpdump_tool is None:
+            session.event("warning", message="tcpdump is not available")
+        else:
+            tools.append(tcpdump_tool)
+            session.event("tool_start", tool="tcpdump", output=tcpdump_tool.output)
+
+    monitor_result: dict[str, Any] = {}
+    monitor_thread = threading.Thread(
+        target=lambda: monitor_result.update(
+            monitor_loop(root_pid, session, args.include_env, args.interval, stop_event)
+        ),
+        daemon=True,
+    )
+    monitor_thread.start()
+
+    deadline = time.time() + args.duration if args.duration else None
+    try:
+        while not stop_event.is_set():
+            if target_proc is not None and target_proc.poll() is not None:
+                session.event("process_exit", pid=root_pid, returncode=target_proc.returncode)
+                stop_event.set()
+                break
+            if args.mode == "run" and target_proc is None and not Path(f"/proc/{root_pid}").exists():
+                stop_event.set()
+                break
+            if deadline is not None and time.time() >= deadline:
+                session.event("duration_reached", seconds=args.duration)
+                stop_event.set()
+                if target_proc is not None and target_proc.poll() is None:
+                    target_proc.terminate()
+                break
+            if not Path(f"/proc/{root_pid}").exists():
+                stop_event.set()
+                break
+            time.sleep(0.2)
+    finally:
+        stop_event.set()
+        monitor_thread.join(timeout=max(1.0, args.interval * 2))
+        for tool in tools:
+            terminate_tool(tool, session)
+        if target_proc is not None and target_proc.poll() is None:
+            target_proc.terminate()
+            try:
+                target_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                target_proc.kill()
+
+    summary.update(
+        {
+            "finished_at": utc_now(),
+            "root_pid": root_pid,
+            "snapshot_count": monitor_result.get("snapshot_count", 0),
+            "last_seen_pids": monitor_result.get("last_tree", []),
+            "target_returncode": (
+                target_proc.returncode
+                if target_proc is not None
+                else next((tool.proc.returncode for tool in tools if tool.name == "strace"), None)
+            ),
+        }
+    )
+    session.write_json("summary.json", summary)
+    print(output_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

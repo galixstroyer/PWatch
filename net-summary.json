@@ -1,0 +1,20 @@
+{
+  "command": [
+    "curl",
+    "-I",
+    "https://example.com"
+  ],
+  "events_file": "/media/gideond/storage/Projects/ProcessWatcher/net-events.jsonl",
+  "finished_at": "2026-04-03T02:57:14.292919+00:00",
+  "hostname": "gideon-b660ds3hacddr4y1",
+  "last_seen_pids": [
+    713129
+  ],
+  "mode": "run",
+  "output_dir": "/media/gideond/storage/Projects/ProcessWatcher/pwatch-20260402-205714",
+  "root_pid": 713129,
+  "snapshot_count": 1,
+  "started_at": "2026-04-03T02:57:14.041478+00:00",
+  "summary_file": "/media/gideond/storage/Projects/ProcessWatcher/net-summary.json",
+  "target_returncode": 0
+}
