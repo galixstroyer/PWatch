@@ -24,6 +24,17 @@ Show built-in help:
 ./pwatch -h
 ./pwatch run -h
 ./pwatch attach -h
+./pwatch net -h
+./pwatch net-run -h
+```
+
+Simple network-focused usage:
+
+```bash
+./pwatch net 12345
+sudo ./pwatch net 12345
+./pwatch net-run -- curl https://example.com
+sudo ./pwatch net-run -- curl https://example.com
 ```
 
 Persist capture artifacts:
@@ -43,6 +54,8 @@ Capture packet-level metadata for DNS and TLS hostname extraction:
 ```bash
 sudo ./pwatch --save --pcap --duration 60 run -- curl -I https://example.com
 ```
+
+`net` and `net-run` are the simple front door. They automatically save data, and when run as `root` they also turn on packet capture and the eBPF network backend.
 
 Write the live event stream and final summary to explicit file paths:
 
@@ -95,6 +108,8 @@ When `--save` is used, each run creates a directory containing:
 - `tls_sni_summary.json`
 - `strace*`
 - `traffic.pcap` when `--pcap` is enabled
+- `network_report.json`
+- `network_report.md`
 
 `events.jsonl` contains structured snapshots with process details, open file descriptors, `lsof` results, and `ss` connection state.
 
@@ -104,6 +119,8 @@ When `--save` is used, each run creates a directory containing:
 - reverse DNS names when resolution succeeds
 - DNS names learned from captured DNS responses when `--pcap` is enabled
 - TLS SNI hostnames learned from captured TLS handshakes when `--pcap` is enabled
+
+`network_report.json` and `network_report.md` are the simplest destination-focused outputs for humans and AIs.
 
 ## Agent-Friendly Usage
 

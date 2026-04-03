@@ -170,6 +170,26 @@ def normalize_ip(ip: str | None) -> str | None:
     return ip
 
 
+def is_local_ip(ip: str | None) -> bool:
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_link_local
+
+
+def is_private_ip(ip: str | None) -> bool:
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_private
+
+
 class EndpointResolver:
     def __init__(self) -> None:
         self.cache: dict[str, list[str]] = {}
@@ -506,6 +526,89 @@ def finalize_endpoint_rollups(
         rows.append(row)
     rows.sort(key=lambda item: (item["pid"] is None, item["pid"] or -1, item["remote_ip"], item["remote_port"]))
     return rows
+
+
+def build_network_report(
+    endpoint_summary: list[dict[str, Any]],
+    dns_summary: list[dict[str, Any]],
+    tls_sni_summary: list[dict[str, Any]],
+) -> dict[str, Any]:
+    report_rows: list[dict[str, Any]] = []
+    for row in endpoint_summary:
+        remote_ip = row.get("remote_ip")
+        if not remote_ip:
+            continue
+        confidence = "high" if row.get("pid") is not None else "medium" if row.get("tls_sni") or row.get("dns_names") else "low"
+        report_rows.append(
+            {
+                "confidence": confidence,
+                "pid": row.get("pid"),
+                "proto": row.get("proto"),
+                "remote_ip": remote_ip,
+                "remote_port": row.get("remote_port"),
+                "reverse_dns": row.get("reverse_dns", []),
+                "dns_names": row.get("dns_names", []),
+                "tls_sni": row.get("tls_sni", []),
+                "sources": row.get("sources", []),
+                "seen_count": row.get("seen_count"),
+                "local": row.get("local"),
+                "remote": row.get("remote"),
+                "is_loopback": is_local_ip(remote_ip),
+                "is_private": is_private_ip(remote_ip),
+                "first_seen": row.get("first_seen"),
+                "last_seen": row.get("last_seen"),
+            }
+        )
+
+    report_rows.sort(
+        key=lambda item: (
+            item["is_loopback"],
+            item["is_private"],
+            item["confidence"] != "high",
+            item["confidence"] == "low",
+            item["remote_ip"],
+            item["remote_port"] or 0,
+        )
+    )
+    return {
+        "likely_destinations": report_rows,
+        "dns_records": dns_summary,
+        "tls_sni_records": tls_sni_summary,
+    }
+
+
+def build_network_report_markdown(report: dict[str, Any]) -> str:
+    lines = ["# Network Report", ""]
+    rows = report.get("likely_destinations", [])
+    if not rows:
+        lines.append("No destination endpoints were identified.")
+    else:
+        lines.append("## Likely Destinations")
+        for row in rows[:25]:
+            names = row.get("tls_sni") or row.get("dns_names") or row.get("reverse_dns") or []
+            name_text = ", ".join(names) if names else "no hostname"
+            pid_text = f"pid={row['pid']}" if row.get("pid") is not None else "pid=unknown"
+            lines.append(
+                f"- {row['remote_ip']}:{row['remote_port']} {row['proto']} {pid_text} "
+                f"confidence={row['confidence']} names={name_text}"
+            )
+    if report.get("tls_sni_records"):
+        lines.extend(["", "## TLS SNI"])
+        seen: set[str] = set()
+        for row in report["tls_sni_records"]:
+            key = f"{row.get('dst')}|{row.get('dst_port')}|{row.get('sni')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- {row.get('dst')}:{row.get('dst_port')} -> {row.get('sni')}")
+    if report.get("dns_records"):
+        lines.extend(["", "## DNS"])
+        for row in report["dns_records"][:25]:
+            if row.get("query") or row.get("answers"):
+                answers = ", ".join(row.get("answers", [])) or "no answers"
+                lines.append(f"- {row.get('query') or row.get('response_name')}: {answers}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def parse_lsof_output(text: str) -> list[dict[str, Any]]:
@@ -1049,6 +1152,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  pwatch run -- curl https://example.com\n"
             "  pwatch --duration 15 attach 12345\n"
+            "  pwatch net 12345\n"
+            "  pwatch net-run -- curl https://example.com\n"
             "  sudo pwatch --pcap --pcap-filter \"tcp port 443\" attach 12345\n\n"
             "Notes:\n"
             "  - run mode is best when you can start the target yourself.\n"
@@ -1103,6 +1208,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Start a command, then observe it.")
     run.add_argument("command", nargs=argparse.REMAINDER, help="Command to run. Use: pwatch run -- <cmd> ...")
 
+    net = subparsers.add_parser("net", help="Simple network-focused monitoring for an existing PID.")
+    net.add_argument("pid", type=int, help="PID to observe.")
+
+    net_run = subparsers.add_parser("net-run", help="Simple network-focused monitoring for a new command.")
+    net_run.add_argument("command", nargs=argparse.REMAINDER, help="Command to run. Use: pwatch net-run -- <cmd> ...")
+
     return parser
 
 
@@ -1115,6 +1226,14 @@ def resolve_output_dir(raw: str | None) -> Path:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.mode in {"net", "net-run"}:
+        args.save = True
+        if os.geteuid() == 0:
+            args.pcap = True
+            args.ebpf_network = True
+        summary_mode = "attach" if args.mode == "net" else "run"
+    else:
+        summary_mode = args.mode
     if not args.save and (args.output or args.events_file or args.summary_file or args.pcap):
         print("--output, --events-file, --summary-file, and --pcap require --save.", file=sys.stderr)
         return 2
@@ -1132,7 +1251,8 @@ def main() -> int:
     tools: list[ToolProcess] = []
     summary: dict[str, Any] = {
         "started_at": utc_now(),
-        "mode": args.mode,
+        "mode": summary_mode,
+        "requested_mode": args.mode,
         "output_dir": str(output_dir),
         "events_file": str(session.events_path),
         "summary_file": str(session.summary_path),
@@ -1140,12 +1260,12 @@ def main() -> int:
     }
     pending_ebpf_tool: ToolProcess | None = None
     pending_tcpdump_tool: ToolProcess | None = None
-    if args.ebpf_network and os.geteuid() == 0 and args.mode == "run":
+    if args.ebpf_network and os.geteuid() == 0 and summary_mode == "run":
         pending_ebpf_tool = spawn_bpftrace_network(output_dir)
-    if args.pcap and args.mode == "run":
+    if args.pcap and summary_mode == "run":
         pending_tcpdump_tool = spawn_tcpdump(output_dir, args.pcap_filter)
 
-    if args.mode == "run":
+    if summary_mode == "run":
         command = args.command
         if command and command[0] == "--":
             command = command[1:]
@@ -1201,7 +1321,7 @@ def main() -> int:
             "summary_file": str(session.summary_path),
         },
     )
-    session.event("session_start", root_pid=root_pid, mode=args.mode)
+    session.event("session_start", root_pid=root_pid, mode=summary_mode, requested_mode=args.mode)
     console(f"[pwatch] mode={args.mode} root_pid={root_pid}")
     if args.save:
         console(f"[pwatch] output_dir={output_dir}")
@@ -1209,8 +1329,13 @@ def main() -> int:
         console(f"[pwatch] summary_file={session.summary_path}")
     else:
         console("[pwatch] save=off temporary capture will be deleted on exit")
-    if args.mode == "attach" and args.duration is None:
+    if summary_mode == "attach" and args.duration is None:
         console("[pwatch] attach is running until you press Ctrl-C")
+    if args.mode in {"net", "net-run"}:
+        if os.geteuid() == 0:
+            console("[pwatch] network mode: packet capture enabled")
+        else:
+            console("[pwatch] network mode: run with sudo for packet capture, DNS, and TLS SNI")
     if args.ebpf_network and os.geteuid() != 0:
         console("[pwatch] warning: --ebpf-network requires root; run with sudo")
 
@@ -1224,7 +1349,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
 
-    if args.mode == "attach":
+    if summary_mode == "attach":
         strace_tool = spawn_strace(root_pid, output_dir, args.trace_mode, args.string_bytes)
         if strace_tool is None:
             session.event("warning", message="strace is not available")
@@ -1281,7 +1406,7 @@ def main() -> int:
                 session.event("process_exit", pid=root_pid, returncode=target_proc.returncode)
                 stop_event.set()
                 break
-            if args.mode == "run" and target_proc is None and not Path(f"/proc/{root_pid}").exists():
+            if summary_mode == "run" and target_proc is None and not Path(f"/proc/{root_pid}").exists():
                 stop_event.set()
                 break
             if deadline is not None and time.time() >= deadline:
@@ -1347,6 +1472,9 @@ def main() -> int:
         session.write_json("endpoint_summary.json", endpoint_summary)
         session.write_json("dns_summary.json", dns_summary)
         session.write_json("tls_sni_summary.json", tls_sni_summary)
+        network_report = build_network_report(endpoint_summary, dns_summary, tls_sni_summary)
+        session.write_json("network_report.json", network_report)
+        (output_dir / "network_report.md").write_text(build_network_report_markdown(network_report), encoding="utf-8")
 
     summary.update(
         {
