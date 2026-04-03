@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import ipaddress
 import os
 import re
+import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -87,6 +90,33 @@ def process_tree(root_pid: int) -> list[int]:
     return sorted(ordered)
 
 
+def process_parent(pid: int) -> int | None:
+    status = safe_text(Path(f"/proc/{pid}/status"))
+    if not status:
+        return None
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def is_in_process_tree(root_pid: int, pid: int) -> bool:
+    current = pid
+    seen: set[int] = set()
+    while current not in seen and current > 0:
+        if current == root_pid:
+            return True
+        seen.add(current)
+        parent = process_parent(current)
+        if parent is None:
+            return False
+        current = parent
+    return False
+
+
 def run_capture(cmd: list[str], timeout: float = 5.0) -> dict[str, Any]:
     try:
         proc = subprocess.run(
@@ -113,6 +143,369 @@ def run_capture(cmd: list[str], timeout: float = 5.0) -> dict[str, Any]:
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }
+
+
+def split_host_port(value: str) -> tuple[str | None, int | None]:
+    if not value or value in {"*", "*:*"}:
+        return None, None
+    if value.startswith("[") and "]:" in value:
+        host, port_text = value[1:].rsplit("]:", 1)
+    elif value.count(":") >= 2:
+        host, port_text = value.rsplit(":", 1)
+    elif ":" in value:
+        host, port_text = value.rsplit(":", 1)
+    else:
+        return value, None
+    try:
+        return host, int(port_text)
+    except ValueError:
+        return host, None
+
+
+def normalize_ip(ip: str | None) -> str | None:
+    if not ip:
+        return None
+    if ip == "*" or ip == "0.0.0.0" or ip == "::":
+        return None
+    return ip
+
+
+class EndpointResolver:
+    def __init__(self) -> None:
+        self.cache: dict[str, list[str]] = {}
+
+    def resolve(self, ip: str | None) -> list[str]:
+        if ip is None:
+            return []
+        if ip in self.cache:
+            return self.cache[ip]
+
+        names: list[str] = []
+        result = run_capture(["getent", "hosts", ip], timeout=2)
+        if result.get("ok"):
+            for line in result.get("stdout", "").splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    hostname = parts[1]
+                    if hostname != ip and hostname not in names:
+                        names.append(hostname)
+        self.cache[ip] = names
+        return names
+
+
+def endpoint_key(pid: int, proto: str, remote: str) -> str:
+    return f"{pid}|{proto}|{remote}"
+
+
+def update_endpoint_rollups(
+    rollups: dict[str, dict[str, Any]],
+    *,
+    pid: int,
+    proto: str,
+    local: str | None,
+    remote: str | None,
+    source: str,
+    ts: str,
+) -> None:
+    if not remote:
+        return
+    remote_ip, remote_port = split_host_port(remote)
+    remote_ip = normalize_ip(remote_ip)
+    if remote_ip is None or remote_port in {None, 0}:
+        return
+    local_ip, local_port = split_host_port(local or "")
+    key = endpoint_key(pid, proto, remote)
+    row = rollups.setdefault(
+        key,
+        {
+            "pid": pid,
+            "proto": proto,
+            "remote": remote,
+            "remote_ip": remote_ip,
+            "remote_port": remote_port,
+            "local": local,
+            "local_ip": normalize_ip(local_ip),
+            "local_port": local_port,
+            "sources": [],
+            "first_seen": ts,
+            "last_seen": ts,
+            "seen_count": 0,
+        },
+    )
+    row["last_seen"] = ts
+    row["seen_count"] += 1
+    if source not in row["sources"]:
+        row["sources"].append(source)
+    if not row.get("local") and local:
+        row["local"] = local
+        row["local_ip"] = normalize_ip(local_ip)
+        row["local_port"] = local_port
+
+
+def extract_dns_from_pcap(pcap_path: Path) -> list[dict[str, Any]]:
+    if shutil.which("tshark") is None or not pcap_path.exists():
+        return []
+    result = run_capture(
+        [
+            "tshark",
+            "-r",
+            str(pcap_path),
+            "-Y",
+            "dns",
+            "-T",
+            "fields",
+            "-E",
+            "header=n",
+            "-E",
+            "separator=\t",
+            "-e",
+            "frame.time_epoch",
+            "-e",
+            "ip.src",
+            "-e",
+            "ipv6.src",
+            "-e",
+            "ip.dst",
+            "-e",
+            "ipv6.dst",
+            "-e",
+            "dns.flags.response",
+            "-e",
+            "dns.qry.name",
+            "-e",
+            "dns.resp.name",
+            "-e",
+            "dns.a",
+            "-e",
+            "dns.aaaa",
+        ],
+        timeout=15,
+    )
+    if not result.get("ok"):
+        return []
+
+    records: list[dict[str, Any]] = []
+    for line in result.get("stdout", "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 10:
+            continue
+        ts, ip_src, ipv6_src, ip_dst, ipv6_dst, is_response, qry_name, resp_name, a_recs, aaaa_recs = parts[:10]
+        src = ip_src or ipv6_src or None
+        dst = ip_dst or ipv6_dst or None
+        answers = [value for value in (a_recs.split(",") + aaaa_recs.split(",")) if value]
+        record = {
+            "ts_epoch": ts,
+            "src": src,
+            "dst": dst,
+            "is_response": is_response == "1",
+            "query": qry_name or None,
+            "response_name": resp_name or None,
+            "answers": answers,
+        }
+        records.append(record)
+    return records
+
+
+def extract_tls_sni_from_pcap(pcap_path: Path) -> list[dict[str, Any]]:
+    if shutil.which("tshark") is None or not pcap_path.exists():
+        return []
+    result = run_capture(
+        [
+            "tshark",
+            "-r",
+            str(pcap_path),
+            "-Y",
+            "tls.handshake.extensions_server_name",
+            "-T",
+            "fields",
+            "-E",
+            "header=n",
+            "-E",
+            "separator=\t",
+            "-e",
+            "frame.time_epoch",
+            "-e",
+            "ip.src",
+            "-e",
+            "ipv6.src",
+            "-e",
+            "tcp.srcport",
+            "-e",
+            "ip.dst",
+            "-e",
+            "ipv6.dst",
+            "-e",
+            "tcp.dstport",
+            "-e",
+            "tls.handshake.extensions_server_name",
+        ],
+        timeout=15,
+    )
+    if not result.get("ok"):
+        return []
+
+    records: list[dict[str, Any]] = []
+    for line in result.get("stdout", "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 8:
+            continue
+        ts, ip_src, ipv6_src, src_port, ip_dst, ipv6_dst, dst_port, sni = parts[:8]
+        if not sni:
+            continue
+        try:
+            src_port_int = int(src_port) if src_port else None
+        except ValueError:
+            src_port_int = None
+        try:
+            dst_port_int = int(dst_port) if dst_port else None
+        except ValueError:
+            dst_port_int = None
+        records.append(
+            {
+                "ts_epoch": ts,
+                "src": ip_src or ipv6_src or None,
+                "src_port": src_port_int,
+                "dst": ip_dst or ipv6_dst or None,
+                "dst_port": dst_port_int,
+                "sni": sni,
+            }
+        )
+    return records
+
+
+def extract_endpoints_from_pcap(pcap_path: Path) -> list[dict[str, Any]]:
+    if shutil.which("tshark") is None or not pcap_path.exists():
+        return []
+    result = run_capture(
+        [
+            "tshark",
+            "-r",
+            str(pcap_path),
+            "-T",
+            "fields",
+            "-E",
+            "header=n",
+            "-E",
+            "separator=\t",
+            "-e",
+            "frame.time_epoch",
+            "-e",
+            "ip.src",
+            "-e",
+            "ipv6.src",
+            "-e",
+            "tcp.srcport",
+            "-e",
+            "udp.srcport",
+            "-e",
+            "ip.dst",
+            "-e",
+            "ipv6.dst",
+            "-e",
+            "tcp.dstport",
+            "-e",
+            "udp.dstport",
+        ],
+        timeout=15,
+    )
+    if not result.get("ok"):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for line in result.get("stdout", "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 9:
+            continue
+        ts, ip_src, ipv6_src, tcp_src, udp_src, ip_dst, ipv6_dst, tcp_dst, udp_dst = parts[:9]
+        src = ip_src or ipv6_src or None
+        dst = ip_dst or ipv6_dst or None
+        proto = "tcp" if tcp_dst else "udp" if udp_dst else None
+        src_port = tcp_src or udp_src or None
+        dst_port = tcp_dst or udp_dst or None
+        if not proto or not src or not dst or not dst_port:
+            continue
+        try:
+            src_port_int = int(src_port) if src_port else None
+            dst_port_int = int(dst_port)
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "ts_epoch": ts,
+                "proto": proto,
+                "local_ip": src,
+                "local_port": src_port_int,
+                "remote_ip": dst,
+                "remote_port": dst_port_int,
+            }
+        )
+    return rows
+
+
+def finalize_endpoint_rollups(
+    rollups: dict[str, dict[str, Any]],
+    resolver: EndpointResolver,
+    dns_records: list[dict[str, Any]],
+    tls_sni_records: list[dict[str, Any]],
+    pcap_endpoints: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    dns_names_by_ip: dict[str, set[str]] = {}
+    for record in dns_records:
+        name = record.get("query") or record.get("response_name")
+        if not name:
+            continue
+        for answer in record.get("answers", []):
+            dns_names_by_ip.setdefault(answer, set()).add(name)
+
+    sni_by_ip: dict[str, set[str]] = {}
+    for record in tls_sni_records:
+        dst = record.get("dst")
+        sni = record.get("sni")
+        if dst and sni:
+            sni_by_ip.setdefault(dst, set()).add(sni)
+
+    for record in pcap_endpoints:
+        remote_ip = normalize_ip(record.get("remote_ip"))
+        remote_port = record.get("remote_port")
+        if remote_ip is None or remote_port in {None, 0}:
+            continue
+        key = endpoint_key(-1, record.get("proto", "unknown"), f"{remote_ip}:{remote_port}")
+        row = rollups.setdefault(
+            key,
+            {
+                "pid": None,
+                "proto": record.get("proto", "unknown"),
+                "remote": f"{remote_ip}:{remote_port}",
+                "remote_ip": remote_ip,
+                "remote_port": remote_port,
+                "local": (
+                    f"{record['local_ip']}:{record['local_port']}"
+                    if record.get("local_ip") and record.get("local_port") is not None
+                    else None
+                ),
+                "local_ip": normalize_ip(record.get("local_ip")),
+                "local_port": record.get("local_port"),
+                "sources": [],
+                "first_seen": record.get("ts_epoch"),
+                "last_seen": record.get("ts_epoch"),
+                "seen_count": 0,
+            },
+        )
+        row["seen_count"] += 1
+        row["last_seen"] = record.get("ts_epoch")
+        if "pcap" not in row["sources"]:
+            row["sources"].append("pcap")
+
+    rows: list[dict[str, Any]] = []
+    for row in rollups.values():
+        remote_ip = row.get("remote_ip")
+        row = dict(row)
+        row["reverse_dns"] = resolver.resolve(remote_ip)
+        row["dns_names"] = sorted(dns_names_by_ip.get(remote_ip or "", set()))
+        row["tls_sni"] = sorted(sni_by_ip.get(remote_ip or "", set()))
+        rows.append(row)
+    rows.sort(key=lambda item: (item["pid"] is None, item["pid"] or -1, item["remote_ip"], item["remote_port"]))
+    return rows
 
 
 def parse_lsof_output(text: str) -> list[dict[str, Any]]:
@@ -393,6 +786,144 @@ def spawn_tcpdump(output_dir: Path, bpf_filter: str | None) -> ToolProcess | Non
     return ToolProcess("tcpdump", proc, str(output_dir / "traffic.pcap"))
 
 
+def ebpf_network_program() -> str:
+    return r"""
+tracepoint:syscalls:sys_enter_socket
+{
+  printf("NET|%d|%d|%s|socket|family=%d type=%d protocol=%d\n",
+         pid, tid, comm, args.family, args.type, args.protocol);
+}
+
+tracepoint:syscalls:sys_enter_bind
+{
+  printf("NET|%d|%d|%s|bind|fd=%d addrlen=%d\n",
+         pid, tid, comm, args.fd, args.addrlen);
+}
+
+tracepoint:syscalls:sys_enter_connect
+{
+  printf("NET|%d|%d|%s|connect|fd=%d addrlen=%d\n",
+         pid, tid, comm, args.fd, args.addrlen);
+}
+
+tracepoint:syscalls:sys_enter_accept4
+{
+  printf("NET|%d|%d|%s|accept4|fd=%d flags=%d\n",
+         pid, tid, comm, args.fd, args.flags);
+}
+
+tracepoint:syscalls:sys_enter_sendto
+{
+  printf("NET|%d|%d|%s|sendto|fd=%d len=%d flags=%d addr_len=%d\n",
+         pid, tid, comm, args.fd, args.len, args.flags, args.addr_len);
+}
+
+tracepoint:syscalls:sys_enter_sendmsg
+{
+  printf("NET|%d|%d|%s|sendmsg|fd=%d flags=%d\n",
+         pid, tid, comm, args.fd, args.flags);
+}
+
+tracepoint:syscalls:sys_enter_recvfrom
+{
+  printf("NET|%d|%d|%s|recvfrom|fd=%d size=%d flags=%d addr_len=%d\n",
+         pid, tid, comm, args.fd, args.size, args.flags, args.addr_len);
+}
+
+tracepoint:syscalls:sys_enter_recvmsg
+{
+  printf("NET|%d|%d|%s|recvmsg|fd=%d flags=%d\n",
+         pid, tid, comm, args.fd, args.flags);
+}
+
+tracepoint:syscalls:sys_enter_close
+{
+  printf("NET|%d|%d|%s|close|fd=%d\n",
+         pid, tid, comm, args.fd);
+}
+"""
+
+
+def spawn_bpftrace_network(output_dir: Path) -> ToolProcess | None:
+    if shutil.which("bpftrace") is None:
+        return None
+    script_path = output_dir / "ebpf-network.bt"
+    script_path.write_text(ebpf_network_program())
+    cmd = ["bpftrace", "-q", str(script_path)]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    return ToolProcess("bpftrace-network", proc, str(script_path))
+
+
+def parse_ebpf_network_line(line: str) -> dict[str, Any] | None:
+    line = line.strip()
+    if not line.startswith("NET|"):
+        return None
+    parts = line.split("|", 5)
+    if len(parts) != 6:
+        return None
+    _, pid_text, tid_text, comm, op, payload = parts
+    try:
+        pid = int(pid_text)
+        tid = int(tid_text)
+    except ValueError:
+        return None
+
+    fields: dict[str, Any] = {}
+    for token in shlex.split(payload):
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        try:
+            fields[key] = int(value)
+        except ValueError:
+            fields[key] = value
+
+    return {
+        "pid": pid,
+        "tid": tid,
+        "comm": comm,
+        "op": op,
+        "fields": fields,
+        "raw": line,
+    }
+
+
+def collect_ebpf_network(
+    root_pid: int,
+    tool: ToolProcess,
+    session: Session,
+    stop_event: threading.Event,
+    stats: dict[str, Any],
+) -> None:
+    stats["event_count"] = 0
+    stats["filtered_count"] = 0
+
+    if tool.proc.stdout is None:
+        return
+
+    while not stop_event.is_set():
+        line = tool.proc.stdout.readline()
+        if not line:
+            if tool.proc.poll() is not None:
+                break
+            continue
+        event = parse_ebpf_network_line(line)
+        if event is None:
+            continue
+        stats["event_count"] += 1
+
+        if not is_in_process_tree(root_pid, event["pid"]):
+            continue
+
+        stats["filtered_count"] += 1
+        session.event("ebpf_network", root_pid=root_pid, **event)
+
 def terminate_tool(tool: ToolProcess, session: Session) -> None:
     if tool.proc.poll() is None:
         tool.proc.terminate()
@@ -422,12 +953,14 @@ def monitor_loop(
     snapshot_count = 0
     last_tree: list[int] = []
     last_status = 0.0
+    endpoint_rollups: dict[str, dict[str, Any]] = {}
     while not stop_event.is_set():
         if not Path(f"/proc/{root_pid}").exists():
             session.event("process_exit", pid=root_pid)
             console(f"[pwatch] target exited: pid={root_pid}")
             break
 
+        sample_ts = utc_now()
         pids = process_tree(root_pid)
         last_tree = pids
         proc_data = []
@@ -440,7 +973,17 @@ def monitor_loop(
                 for inode in socket_inodes_from_fd_links(snapshot["fd_links"]):
                     row = proc_net.get(inode)
                     if row:
-                        socket_rows.append({"pid": pid, **row})
+                        socket_row = {"pid": pid, **row}
+                        socket_rows.append(socket_row)
+                        update_endpoint_rollups(
+                            endpoint_rollups,
+                            pid=pid,
+                            proto=row.get("proto", "unknown"),
+                            local=row.get("local"),
+                            remote=row.get("remote"),
+                            source="proc_net",
+                            ts=sample_ts,
+                        )
 
         lsof_rows: list[dict[str, Any]] = []
         for pid in pids:
@@ -450,6 +993,19 @@ def monitor_loop(
 
         ss_result = run_capture(["ss", "-tpna"], timeout=5)
         ss_rows = parse_ss_output(ss_result.get("stdout", ""), set(pids)) if ss_result.get("stdout") else []
+        for row in ss_rows:
+            matched_pid = row.get("matched_pid")
+            if matched_pid is None:
+                continue
+            update_endpoint_rollups(
+                endpoint_rollups,
+                pid=matched_pid,
+                proto="tcp",
+                local=row.get("local"),
+                remote=row.get("peer"),
+                source="ss",
+                ts=sample_ts,
+            )
 
         session.event(
             "snapshot",
@@ -471,7 +1027,11 @@ def monitor_loop(
             last_status = now
         stop_event.wait(interval)
 
-    return {"snapshot_count": snapshot_count, "last_tree": last_tree}
+    return {
+        "snapshot_count": snapshot_count,
+        "last_tree": last_tree,
+        "endpoint_rollups": list(endpoint_rollups.values()),
+    }
 
 
 def signal_name(sig: int) -> str:
@@ -523,6 +1083,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use network-only syscall tracing or a broader syscall set.",
     )
     parser.add_argument("--string-bytes", type=int, default=4096, help="Max string bytes for strace decoding.")
+    parser.add_argument(
+        "--ebpf-network",
+        action="store_true",
+        help="Use bpftrace/eBPF to collect high-frequency network syscall events. Requires root.",
+    )
     parser.add_argument("--pcap", action="store_true", help="Capture host-level packets to traffic.pcap with tcpdump.")
     parser.add_argument(
         "--pcap-filter",
@@ -573,6 +1138,12 @@ def main() -> int:
         "summary_file": str(session.summary_path),
         "hostname": os.uname().nodename,
     }
+    pending_ebpf_tool: ToolProcess | None = None
+    pending_tcpdump_tool: ToolProcess | None = None
+    if args.ebpf_network and os.geteuid() == 0 and args.mode == "run":
+        pending_ebpf_tool = spawn_bpftrace_network(output_dir)
+    if args.pcap and args.mode == "run":
+        pending_tcpdump_tool = spawn_tcpdump(output_dir, args.pcap_filter)
 
     if args.mode == "run":
         command = args.command
@@ -623,6 +1194,7 @@ def main() -> int:
             "include_env": args.include_env,
             "trace_mode": args.trace_mode,
             "string_bytes": args.string_bytes,
+            "ebpf_network": args.ebpf_network,
             "pcap": args.pcap,
             "pcap_filter": args.pcap_filter,
             "events_file": str(session.events_path),
@@ -639,6 +1211,8 @@ def main() -> int:
         console("[pwatch] save=off temporary capture will be deleted on exit")
     if args.mode == "attach" and args.duration is None:
         console("[pwatch] attach is running until you press Ctrl-C")
+    if args.ebpf_network and os.geteuid() != 0:
+        console("[pwatch] warning: --ebpf-network requires root; run with sudo")
 
     def stop_handler(signum: int, _frame: Any) -> None:
         session.event("signal", signal=signal_name(signum))
@@ -660,8 +1234,29 @@ def main() -> int:
             session.event("tool_start", tool="strace", output=strace_tool.output)
             console(f"[pwatch] strace output={strace_tool.output}")
 
+    ebpf_stats: dict[str, Any] = {}
+    ebpf_thread: threading.Thread | None = None
+    if args.ebpf_network:
+        if os.geteuid() != 0:
+            session.event("warning", message="--ebpf-network requires root")
+        else:
+            ebpf_tool = pending_ebpf_tool if pending_ebpf_tool is not None else spawn_bpftrace_network(output_dir)
+            if ebpf_tool is None:
+                session.event("warning", message="bpftrace is not available")
+                console("[pwatch] warning: bpftrace is not available")
+            else:
+                tools.append(ebpf_tool)
+                session.event("tool_start", tool="bpftrace-network", output=ebpf_tool.output)
+                console(f"[pwatch] bpftrace script={ebpf_tool.output}")
+                ebpf_thread = threading.Thread(
+                    target=collect_ebpf_network,
+                    args=(root_pid, ebpf_tool, session, stop_event, ebpf_stats),
+                    daemon=True,
+                )
+                ebpf_thread.start()
+
     if args.pcap:
-        tcpdump_tool = spawn_tcpdump(output_dir, args.pcap_filter)
+        tcpdump_tool = pending_tcpdump_tool if pending_tcpdump_tool is not None else spawn_tcpdump(output_dir, args.pcap_filter)
         if tcpdump_tool is None:
             session.event("warning", message="tcpdump is not available")
             console("[pwatch] warning: tcpdump is not available")
@@ -702,6 +1297,8 @@ def main() -> int:
     finally:
         stop_event.set()
         monitor_thread.join(timeout=max(1.0, args.interval * 2))
+        if ebpf_thread is not None:
+            ebpf_thread.join(timeout=2)
         for tool in tools:
             terminate_tool(tool, session)
         if target_proc is not None and target_proc.poll() is None:
@@ -717,11 +1314,45 @@ def main() -> int:
             "root_pid": root_pid,
             "snapshot_count": monitor_result.get("snapshot_count", 0),
             "last_seen_pids": monitor_result.get("last_tree", []),
+            "ebpf_event_count": ebpf_stats.get("filtered_count", 0),
+            "ebpf_raw_event_count": ebpf_stats.get("event_count", 0),
             "target_returncode": (
                 target_proc.returncode
                 if target_proc is not None
                 else next((tool.proc.returncode for tool in tools if tool.name == "strace"), None)
             ),
+        }
+    )
+
+    endpoint_summary: list[dict[str, Any]] = []
+    dns_summary: list[dict[str, Any]] = []
+    tls_sni_summary: list[dict[str, Any]] = []
+    if args.save:
+        resolver = EndpointResolver()
+        pcap_path = output_dir / "traffic.pcap"
+        dns_summary = extract_dns_from_pcap(pcap_path) if args.pcap else []
+        tls_sni_summary = extract_tls_sni_from_pcap(pcap_path) if args.pcap else []
+        pcap_endpoints = extract_endpoints_from_pcap(pcap_path) if args.pcap else []
+        endpoint_rollups = {
+            endpoint_key(row["pid"], row["proto"], row["remote"]): row
+            for row in monitor_result.get("endpoint_rollups", [])
+        }
+        endpoint_summary = finalize_endpoint_rollups(
+            endpoint_rollups,
+            resolver,
+            dns_summary,
+            tls_sni_summary,
+            pcap_endpoints,
+        )
+        session.write_json("endpoint_summary.json", endpoint_summary)
+        session.write_json("dns_summary.json", dns_summary)
+        session.write_json("tls_sni_summary.json", tls_sni_summary)
+
+    summary.update(
+        {
+            "endpoint_count": len(endpoint_summary),
+            "dns_record_count": len(dns_summary),
+            "tls_sni_count": len(tls_sni_summary),
         }
     )
     session.write_json("summary.json", summary)

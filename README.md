@@ -8,6 +8,14 @@
 - `ss` snapshots for live TCP and UDP connections
 - optional `tcpdump` packet capture to a PCAP file
 
+It also has an optional eBPF network mode:
+
+- `--ebpf-network` starts a `bpftrace` program in the kernel
+- it records high-frequency socket syscalls such as `socket`, `bind`, `connect`, `accept4`, `send*`, `recv*`, and `close`
+- those events are filtered back to the watched PID tree in user space and written as `ebpf_network` records in `events.jsonl`
+- this requires `root`
+- it works best for longer-lived processes or when you attach to an already-running target
+
 ## Usage
 
 Show built-in help:
@@ -22,6 +30,18 @@ Persist capture artifacts:
 
 ```bash
 ./pwatch --save --duration 60 attach 12345
+```
+
+Enable the eBPF network backend:
+
+```bash
+sudo ./pwatch --save --ebpf-network --duration 60 attach 12345
+```
+
+Capture packet-level metadata for DNS and TLS hostname extraction:
+
+```bash
+sudo ./pwatch --save --pcap --duration 60 run -- curl -I https://example.com
 ```
 
 Write the live event stream and final summary to explicit file paths:
@@ -70,10 +90,20 @@ When `--save` is used, each run creates a directory containing:
 - `metadata.json`
 - `summary.json`
 - `events.jsonl`
+- `endpoint_summary.json`
+- `dns_summary.json`
+- `tls_sni_summary.json`
 - `strace*`
 - `traffic.pcap` when `--pcap` is enabled
 
 `events.jsonl` contains structured snapshots with process details, open file descriptors, `lsof` results, and `ss` connection state.
+
+`endpoint_summary.json` rolls up where observed connections went, including:
+
+- remote IP and port
+- reverse DNS names when resolution succeeds
+- DNS names learned from captured DNS responses when `--pcap` is enabled
+- TLS SNI hostnames learned from captured TLS handshakes when `--pcap` is enabled
 
 ## Agent-Friendly Usage
 
@@ -91,3 +121,5 @@ With `--save`, the command prints the capture directory path on stdout when it f
 - `tcpdump` captures host traffic, not only one PID, so use `--pcap-filter` to narrow it.
 - `strace` attach can be blocked by Linux ptrace restrictions or permissions.
 - `run` launches the target under `strace`, so it captures earlier process activity than `attach`.
+- `--ebpf-network` improves syscall-level network visibility, but it still does not give decrypted HTTPS bodies or full application-layer request semantics.
+- `--ebpf-network` PID-tree filtering is best-effort for very short-lived child processes, because those tasks can exit before user-space correlation finishes.
