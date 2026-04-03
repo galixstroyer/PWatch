@@ -18,10 +18,17 @@ Show built-in help:
 ./pwatch attach -h
 ```
 
+Persist capture artifacts:
+
+```bash
+./pwatch --save --duration 60 attach 12345
+```
+
 Write the live event stream and final summary to explicit file paths:
 
 ```bash
 ./pwatch \
+  --save \
   --events-file ./agent-events.jsonl \
   --summary-file ./agent-summary.json \
   --duration 60 \
@@ -31,7 +38,7 @@ Write the live event stream and final summary to explicit file paths:
 Run a new command under observation:
 
 ```bash
-./pwatch run -- curl https://example.com
+./pwatch --save run -- curl https://example.com
 ```
 
 Attach to an existing process:
@@ -42,21 +49,23 @@ Attach to an existing process:
 
 If you control how the target starts, prefer `run` over `attach`. It captures earlier activity and avoids common Linux `ptrace` restrictions.
 
+While running, `pwatch` prints live status lines to stderr and writes the full structured capture to files.
+
 Write to a specific output directory and stop after 30 seconds:
 
 ```bash
-./pwatch --output ./captures/app --duration 30 attach 12345
+./pwatch --save --output ./captures/app --duration 30 attach 12345
 ```
 
 Include environment variables and host-level packet capture:
 
 ```bash
-sudo ./pwatch --include-env --pcap --pcap-filter "tcp port 443" attach 12345
+sudo ./pwatch --save --include-env --pcap --pcap-filter "tcp port 443" attach 12345
 ```
 
 ## Output
 
-Each run creates a directory containing:
+When `--save` is used, each run creates a directory containing:
 
 - `metadata.json`
 - `summary.json`
@@ -71,10 +80,10 @@ Each run creates a directory containing:
 Agents can run the command directly the same way a human would:
 
 ```bash
-./pwatch --duration 15 attach 12345
+./pwatch --save --duration 15 attach 12345
 ```
 
-The command prints the capture directory path on stdout when it finishes, so an agent can open that directory and inspect the JSON and trace files.
+With `--save`, the command prints the capture directory path on stdout when it finishes, so an agent can open that directory and inspect the JSON and trace files.
 
 ## Limits
 

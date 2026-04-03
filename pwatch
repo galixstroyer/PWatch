@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -316,6 +317,10 @@ class Session:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def console(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
 def spawn_strace(pid: int, output_dir: Path, trace_mode: str, string_bytes: int) -> ToolProcess | None:
     if shutil.which("strace") is None:
         return None
@@ -416,9 +421,11 @@ def monitor_loop(
 ) -> dict[str, Any]:
     snapshot_count = 0
     last_tree: list[int] = []
+    last_status = 0.0
     while not stop_event.is_set():
         if not Path(f"/proc/{root_pid}").exists():
             session.event("process_exit", pid=root_pid)
+            console(f"[pwatch] target exited: pid={root_pid}")
             break
 
         pids = process_tree(root_pid)
@@ -454,6 +461,14 @@ def monitor_loop(
             ss=ss_rows,
         )
         snapshot_count += 1
+        now = time.time()
+        if now - last_status >= max(1.0, interval):
+            console(
+                "[pwatch] snapshot="
+                f"{snapshot_count} root_pid={root_pid} pids={len(pids)} "
+                f"sockets={len(socket_rows)} ss={len(ss_rows)} lsof={len(lsof_rows)}"
+            )
+            last_status = now
         stop_event.wait(interval)
 
     return {"snapshot_count": snapshot_count, "last_tree": last_tree}
@@ -482,7 +497,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("--output", default=None, help="Output directory. Defaults to ./pwatch-<timestamp>.")
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Persist capture artifacts to disk. Without this flag, capture files are kept in a temporary directory and deleted on exit.",
+    )
+    parser.add_argument("--output", default=None, help="Output directory when --save is used. Defaults to ./pwatch-<timestamp>.")
     parser.add_argument(
         "--events-file",
         default=None,
@@ -530,7 +550,16 @@ def resolve_output_dir(raw: str | None) -> Path:
 
 def main() -> int:
     args = build_parser().parse_args()
-    output_dir = resolve_output_dir(args.output)
+    if not args.save and (args.output or args.events_file or args.summary_file or args.pcap):
+        print("--output, --events-file, --summary-file, and --pcap require --save.", file=sys.stderr)
+        return 2
+
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    if args.save:
+        output_dir = resolve_output_dir(args.output)
+    else:
+        temp_dir = tempfile.TemporaryDirectory(prefix="pwatch-")
+        output_dir = Path(temp_dir.name).resolve()
     session = Session(output_dir, args.events_file, args.summary_file)
     stop_event = threading.Event()
     root_pid: int
@@ -601,9 +630,19 @@ def main() -> int:
         },
     )
     session.event("session_start", root_pid=root_pid, mode=args.mode)
+    console(f"[pwatch] mode={args.mode} root_pid={root_pid}")
+    if args.save:
+        console(f"[pwatch] output_dir={output_dir}")
+        console(f"[pwatch] events_file={session.events_path}")
+        console(f"[pwatch] summary_file={session.summary_path}")
+    else:
+        console("[pwatch] save=off temporary capture will be deleted on exit")
+    if args.mode == "attach" and args.duration is None:
+        console("[pwatch] attach is running until you press Ctrl-C")
 
     def stop_handler(signum: int, _frame: Any) -> None:
         session.event("signal", signal=signal_name(signum))
+        console(f"[pwatch] stopping on signal={signal_name(signum)}")
         stop_event.set()
         if target_proc is not None and target_proc.poll() is None:
             target_proc.terminate()
@@ -615,17 +654,21 @@ def main() -> int:
         strace_tool = spawn_strace(root_pid, output_dir, args.trace_mode, args.string_bytes)
         if strace_tool is None:
             session.event("warning", message="strace is not available")
+            console("[pwatch] warning: strace is not available")
         else:
             tools.append(strace_tool)
             session.event("tool_start", tool="strace", output=strace_tool.output)
+            console(f"[pwatch] strace output={strace_tool.output}")
 
     if args.pcap:
         tcpdump_tool = spawn_tcpdump(output_dir, args.pcap_filter)
         if tcpdump_tool is None:
             session.event("warning", message="tcpdump is not available")
+            console("[pwatch] warning: tcpdump is not available")
         else:
             tools.append(tcpdump_tool)
             session.event("tool_start", tool="tcpdump", output=tcpdump_tool.output)
+            console(f"[pwatch] tcpdump output={tcpdump_tool.output}")
 
     monitor_result: dict[str, Any] = {}
     monitor_thread = threading.Thread(
@@ -682,7 +725,20 @@ def main() -> int:
         }
     )
     session.write_json("summary.json", summary)
-    print(output_dir)
+    if args.save:
+        console(
+            "[pwatch] finished "
+            f"root_pid={root_pid} snapshots={summary['snapshot_count']} "
+            f"summary_file={session.summary_path}"
+        )
+        print(output_dir)
+    else:
+        console(
+            "[pwatch] finished "
+            f"root_pid={root_pid} snapshots={summary['snapshot_count']} save=off"
+        )
+    if temp_dir is not None:
+        temp_dir.cleanup()
     return 0
 
 
